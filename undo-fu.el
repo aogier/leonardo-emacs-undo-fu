@@ -90,11 +90,30 @@ Argument LIST-TO-FIND count the steps up until this undo step.
 Argument COUNT-LIMIT don't count past his value.
 
 Returns the number of steps to reach this list or COUNT-LIMIT."
-  (undo-fu--count-step-to-other
-    (if (or (eq pending-undo-list t) (member last-command '(undo undo-fu-only-undo)))
-      (undo-fu--next-step buffer-undo-list)
-      pending-undo-list)
-    list-to-find count-limit))
+
+  ;; Skip past undo steps, so we don't redo existing undo steps, see #2.
+  (let
+    (
+      (list-start pending-undo-list)
+      (list-start-test nil)
+      (count-limit-test count-limit))
+
+    (setq list-start-test (gethash list-start undo-equiv-table))
+    (while (and (listp list-start-test) (not (null list-start-test)))
+      (setq count-limit count-limit-test)
+      (setq count-limit-test
+        (+
+          count-limit
+          (undo-fu--count-step-to-other list-start list-start-test most-positive-fixnum)))
+      (setq list-start list-start-test)
+      (setq list-start-test (gethash list-start undo-equiv-table)))
+    ;; Finish undo-step offset.
+
+    (undo-fu--count-step-to-other
+      (if (or (eq list-start t) (member last-command '(undo undo-fu-only-undo)))
+        (undo-fu--next-step buffer-undo-list)
+        list-start)
+      list-to-find count-limit)))
 
 
 ;; Public functions.
