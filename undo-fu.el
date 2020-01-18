@@ -53,6 +53,11 @@ causing undo-fu to work with reduced functionality when a selection exists."
   :group 'undo-fu
   :type 'boolean)
 
+(defcustom undo-fu-lock t
+  "When t, prevent undo history from being freed."
+  :group 'undo-fu
+  :type 'boolean)
+
 ;; ---------------------------------------------------------------------------
 ;; Internal Variables
 
@@ -68,6 +73,73 @@ causing undo-fu to work with reduced functionality when a selection exists."
 ;; Initiated an undo-in region (don't use `undo-only').
 ;; Only use when `undo-fu-allow-undo-in-region' is true.
 (defvar-local undo-fu--in-region nil)
+
+;; ---------------------------------------------------------------------------
+;; Undo Locking
+;;
+;; Use when `undo-fu-lock' is t.
+
+;; Override with 'let'.
+(defconst undo-fu--lock-dont-unlock nil)
+(defvar-local undo-fu--lock-dont-unlock-fn
+  (list 'undo-fu-only-undo 'undo-fu-only-redo 'save-buffer 'undo 'undo-only))
+(defvar-local undo-fu--lock-alist nil)
+
+(defun undo-fu--lock-disable-after-change (_beg _end _len)
+  (unless undo-fu--lock-dont-unlock
+    ;; Can be nil since removing the 'after-change' doesn't happen immediately.
+    (when undo-fu--lock-alist
+      (undo-fu--lock-disable))))
+
+(defun undo-fu--without-lock-fn (old-function &rest args)
+  (let ((undo-fu--lock-dont-unlock t))
+    (apply old-function args)))
+
+(defun undo-fu--lock-enable ()
+
+  ;; In case the lock was already enabled, re-enable.
+  (when undo-fu--lock-alist
+    (undo-fu--lock-disable))
+
+  (setq undo-fu--lock-alist
+    (list
+      (cons 'undo-outer-limit undo-outer-limit)
+      (cons 'undo-limit undo-limit)
+      (cons 'undo-strong-limit undo-strong-limit)))
+
+  ;; Don't truncate any undo data in the middle of this.
+  (setq undo-outer-limit nil)
+  (setq undo-limit most-positive-fixnum)
+  (setq undo-strong-limit most-positive-fixnum)
+
+  (dolist (elem undo-fu--lock-dont-unlock-fn)
+    (advice-add elem :around #'undo-fu--without-lock-fn '((name . "undo-fu--advice"))))
+
+  (add-hook 'after-change-functions #'undo-fu--lock-disable-after-change :local)
+
+  (message "Undo Lock Acquired"))
+
+(defun undo-fu--lock-disable ()
+
+  (dolist (elem undo-fu--lock-dont-unlock-fn)
+    (advice-remove elem "undo-fu--advice"))
+
+  (remove-hook 'after-change-functions #'undo-fu--lock-disable-after-change :local)
+
+  (setq undo-outer-limit (alist-get 'undo-outer-limit undo-fu--lock-alist))
+  (setq undo-limit (alist-get 'undo-limit undo-fu--lock-alist))
+  (setq undo-strong-limit (alist-get 'undo-strong-limit undo-fu--lock-alist))
+
+  ;; Clear to indicate we're not locked.
+  (setq undo-fu--lock-alist nil)
+
+  ;; Unrelated to locking, do this to release memory, since it's no longer needed.
+  (undo-fu--checkpoint-unset)
+
+  ;; Account for reduced undo limits.
+  (garbage-collect)
+
+  (message "Undo Lock Released"))
 
 ;; ---------------------------------------------------------------------------
 ;; Internal Functions/Macros
@@ -363,6 +435,14 @@ Optional argument ARG the number of steps to undo."
       (when success
         (when undo-fu--respect
           (setq undo-fu--checkpoint-is-blocking nil)))))
+
+
+  ;; Lock, this handles unlocking it's self.
+  (when undo-fu-lock
+    (when undo-fu--checkpoint
+      (unless undo-fu--lock-alist
+        (undo-fu--lock-enable))))
+
   (setq this-command 'undo-fu-only-undo))
 
 ;; Evil Mode (setup if in use)
