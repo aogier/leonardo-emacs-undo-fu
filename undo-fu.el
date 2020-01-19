@@ -6,7 +6,7 @@
 
 ;; URL: https://gitlab.com/ideasman42/emacs-undo-fu
 ;; Version: 0.2
-;; Package-Requires: ((emacs "24.3"))
+;; Package-Requires: ((emacs "24.4"))
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -117,6 +117,17 @@ Argument LIST compatible list `buffer-undo-list'."
   (while (and list (null (car list)))
     (setq list (cdr list)))
   list)
+
+(defun undo-fu--count-step (list count-limit)
+  "Count the number of steps in
+
+Argument LIST compatible list `buffer-undo-list'.
+Argument COUNT-LIMIT don't count past this value."
+  (let ((count 0))
+    (while (and list (< count count-limit))
+      (setq list (undo-fu--next-step list))
+      (setq count (1+ count)))
+    count))
 
 (defun undo-fu--count-step-to-other (list list-to-find count-limit)
   "Count the number of steps to an item in the undo list.
@@ -388,6 +399,91 @@ Optional argument ARG the number of steps to undo."
 
       (setq this-command 'undo-fu-only-undo)
       success)))
+
+;; ---------------------------------------------------------------------------
+;; Mode Line Info
+;;
+;; For users who want to display the undo step in the mode-line.
+;;
+
+
+;;;###autoload
+(defun undo-fu-info-mode-line (undo-fmt redo-fmt)
+  (unless undo-fu-info-track
+    (user-error "Enable 'undo-fu-info-track' before calling this function."))
+  (when undo-fu--respect
+    (when (numberp undo-fu--info-index)
+      (cond
+        ((eq last-command 'undo-fu-only-undo)
+          (format undo-fmt undo-fu--info-index))
+        ((eq last-command 'undo-fu-only-redo)
+          (format redo-fmt undo-fu--info-index))))))
+
+(defun undo-fu--info-wrap (real-fn &rest args)
+  (let
+    ( ;; Check if a checkpoint is added (reset index).
+      (checkpoint-prev undo-fu--checkpoint)
+      (result nil)
+      (count 0))
+
+    (advice-add 'primitive-undo
+      :around
+      (lambda (sub-real-fn n list)
+        (setq count
+          (+
+            count
+            ;; Skip the nil boundary if it exists.
+            (if (null (car list))
+              (undo-fu--count-step (cdr list) (1- n))
+              (undo-fu--count-step list n))))
+        (funcall sub-real-fn n list))
+      '((name . "undo-fu")))
+
+    (unwind-protect
+      (setq result (apply real-fn args))
+      ;; Ensure we never leave the advice enabled.
+      (advice-remove 'primitive-undo "undo-fu"))
+
+    (when (and undo-fu--respect (not (zerop count)))
+      (unless (eq checkpoint-prev undo-fu--checkpoint)
+        (setq undo-fu--info-index 0))
+      (if (eq this-command 'undo-fu-only-undo)
+        (setq undo-fu--info-index (+ undo-fu--info-index count))
+        (setq undo-fu--info-index (- undo-fu--info-index count))))
+
+    result))
+
+(defun undo-fu--info-turn-on ()
+  (unless undo-fu--info-index
+    (setq undo-fu--info-index nil)
+    (advice-add 'undo-fu-only-undo :around #'undo-fu--info-wrap '((name . "undo-fu--info")))
+    (advice-add 'undo-fu-only-redo :around #'undo-fu--info-wrap '((name . "undo-fu--info")))))
+
+(defun undo-fu--info-turn-off ()
+  (when undo-fu--info-index
+    (setq undo-fu--info-index t)
+    (advice-remove 'undo-fu-only-undo "undo-fu--info")
+    (advice-remove 'undo-fu-only-redo "undo-fu--info")))
+
+;; Number of steps to the checkpoint (for display only).
+;;
+;; - When 'nil' this is disabled.
+;; - When 't' this is enabled, but unset.
+;; - Whrn a number, this is the number of steps to `undo-fu--checkpoint'.
+(defvar-local undo-fu--info-index nil)
+
+;;;###autoload
+(defcustom undo-fu-info-track nil
+  "Keep track of undo step index, enable so ."
+  :group 'undo-fu
+  :initialize
+  #'
+  (lambda (var value)
+    (if (symbol-value var)
+      (undo-fu--info-turn-on)
+      (undo-fu--info-turn-off)))
+  :type 'boolean)
+
 
 ;; Evil Mode (setup if in use)
 ;;
