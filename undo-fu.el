@@ -56,12 +56,6 @@ causing undo-fu to work with reduced functionality when a selection exists."
 ;; ---------------------------------------------------------------------------
 ;; Internal Variables
 
-;; First undo step in the chain, don't redo past this.
-(defvar-local undo-fu--checkpoint nil)
-;; The length of 'undo-fu--checkpoint' (lazy initialize).
-(defvar-local undo-fu--checkpoint-length nil)
-;; We have reached the checkpoint, don't redo.
-(defvar-local undo-fu--checkpoint-is-blocking nil)
 ;; Apply undo/redo constraints to stop redo from undoing or
 ;; passing the initial undo checkpoint.
 (defvar-local undo-fu--respect t)
@@ -72,23 +66,10 @@ causing undo-fu to work with reduced functionality when a selection exists."
 ;; ---------------------------------------------------------------------------
 ;; Internal Functions/Macros
 
-(defun undo-fu--checkpoint-set ()
-  "Set the checkpoint."
-  (setq undo-fu--checkpoint (cdr buffer-undo-list))
-  (setq undo-fu--checkpoint-length nil))
-
-(defun undo-fu--checkpoint-unset ()
-  "Unset the checkpoint."
-  (setq undo-fu--checkpoint nil)
-  (setq undo-fu--checkpoint-length nil))
-
 (defun undo-fu--checkpoint-disable ()
   "Disable using the checkpoint, allowing the initial boundary to be crossed when redoing."
   (setq undo-fu--respect nil)
-  (setq undo-fu--in-region nil)
-  (setq undo-fu--checkpoint-is-blocking nil)
-  (undo-fu--checkpoint-unset))
-
+  (setq undo-fu--in-region nil))
 
 (defmacro undo-fu--with-message-suffix (suffix &rest body)
   "Add text after the message output.
@@ -105,6 +86,35 @@ Optional argument BODY runs with the message suffix."
             (apply ,message-orig (append (list (concat arg "%s")) args (list ,suffix))))))
       ,@body)))
 
+(defun undo-fu--last-change-was-undo-p (undo-list)
+  (while (and (consp undo-list) (eq (car undo-list) nil))
+    (setq undo-list (cdr undo-list)))
+  (gethash undo-list undo-equiv-table))
+
+(defun undo-fu--redo (&optional arg)
+  "Undo the last ARG undos."
+  (interactive "*p")
+  (cond
+    ((not (undo-fu--last-change-was-undo-p buffer-undo-list))
+      (user-error "No undo to undo"))
+    (t
+      (let*
+        (
+          (ul buffer-undo-list)
+          (new-ul
+            (let ((undo-in-progress t))
+              (while (and (consp ul) (eq (car ul) nil))
+                (setq ul (cdr ul)))
+              (primitive-undo arg ul)))
+          (new-pul (undo-fu--last-change-was-undo-p new-ul)))
+        (message
+          "Redo%s"
+          (if undo-in-region
+            " in region"
+            ""))
+        (setq this-command 'undo)
+        (setq pending-undo-list new-pul)
+        (setq buffer-undo-list new-ul)))))
 
 (defun undo-fu--next-step (list)
   "Get the next undo step in the list.
@@ -116,37 +126,6 @@ Argument LIST compatible list `buffer-undo-list'."
     (setq list (cdr list)))
   list)
 
-
-(defun undo-fu--count-step-to-other (list list-to-find count-limit)
-  "Count the number of steps to an item in the undo list.
-
-Argument LIST compatible list `buffer-undo-list'.
-Argument LIST-TO-FIND the list to search for.
-Argument COUNT-LIMIT don't count past this value.
-
-Returns the number of steps to reach this list or COUNT-LIMIT."
-  (let ((count 0))
-    (while (and list (not (eq list list-to-find)) (< count count-limit))
-      (setq list (undo-fu--next-step list))
-      (setq count (1+ count)))
-    count))
-
-
-(defun undo-fu--count-redo-available (list-to-find count-limit was-undo)
-  "Count the number of redo steps until a previously stored step.
-
-Argument LIST-TO-FIND count the steps up until this undo step.
-Argument COUNT-LIMIT don't count past his value.
-Argument WAS-UNDO when non-nil,
-prevents the `pending-undo-list' from being used.
-
-Returns the number of steps to reach this list or COUNT-LIMIT."
-  (undo-fu--count-step-to-other
-    (if (or (eq pending-undo-list t) was-undo)
-      (undo-fu--next-step buffer-undo-list)
-      pending-undo-list)
-    list-to-find count-limit))
-
 ;; ---------------------------------------------------------------------------
 ;; Public Functions
 
@@ -156,9 +135,6 @@ Returns the number of steps to reach this list or COUNT-LIMIT."
 
 wraps the `undo' function."
   (interactive "*")
-  (unless undo-fu--checkpoint
-    (user-error "Redo checkpoint not found!"))
-
   (undo-fu--with-message-suffix " All" (undo-fu-only-redo most-positive-fixnum)))
 
 ;;;###autoload
@@ -216,49 +192,17 @@ Optional argument ARG The number of steps to redo."
           "Redo step not found (%s to ignore)"
           (substitute-command-keys "\\[keyboard-quit]"))))
 
-    (when undo-fu--checkpoint-is-blocking
-      (user-error
-        "Redo end-point hit (%s to step over it)"
-        (substitute-command-keys "\\[keyboard-quit]")))
-
     (when undo-fu--respect
-      ;; Implement "linear" redo.
-      ;; So undo/redo chains before the undo checkpoint never redo an undo step.
-      ;;
-      ;; Without this, redo is still usable, it's just that after undo,redo,undo, ...
-      ;; the redo action will undo, which isn't so useful.
-      ;; This makes redo-only the reverse of undo-only.
-
-      (when
-        (and
-          ;; Not the first redo action.
-          (not (eq t pending-undo-list))
-          ;; Sanity check, since it's not just being used as a marker
-          ;; any (unlikely) issues here would error.
-          (not (null undo-fu--checkpoint)))
-
-        ;; Lazy initialize checkpoint length, avoids calculating for every redo.
-        (unless undo-fu--checkpoint-length
-          (setq undo-fu--checkpoint-length (length undo-fu--checkpoint)))
-
-        ;; Skip to the last matching redo step before the checkpoint.
-        (let ((list pending-undo-list))
-          (while
-            (and
-              (setq list (gethash list undo-equiv-table))
-              (eq (last list undo-fu--checkpoint-length) undo-fu--checkpoint))
-            (setq pending-undo-list list)))))
+      (unless (undo-fu--last-change-was-undo-p buffer-undo-list)
+        (user-error
+          "Redo end-point hit (%s to step over it)"
+          (substitute-command-keys "\\[keyboard-quit]"))))
 
     (let*
       (
         ;; It's important to clamp the number of steps before assigning
         ;; 'last-command' since it's used when checking the available steps.
-        (steps
-          (if (numberp arg)
-            (if (and undo-fu--respect undo-fu--checkpoint)
-              (undo-fu--count-redo-available undo-fu--checkpoint arg was-undo)
-              arg)
-            1))
+        (steps (or arg 1))
         (last-command
           (cond
             (was-undo
@@ -270,23 +214,17 @@ Optional argument ARG The number of steps to redo."
             (t
               ;; No change.
               last-command)))
-        (success
+        (_success
           (condition-case err
             (progn
-              (undo-fu--with-message-suffix
-                (if undo-fu--respect
-                  ""
-                  " (unconstrained)")
-                (undo steps))
+              (if undo-fu--respect
+                (undo-fu--redo steps)
+                (undo-fu--with-message-suffix " (unconstrained)" (undo steps)))
               t)
             (error
               (progn
                 (message "%s" (error-message-string err))
-                nil)))))
-      (when success
-        (when undo-fu--respect
-          (when (eq (gethash buffer-undo-list undo-equiv-table) undo-fu--checkpoint)
-            (setq undo-fu--checkpoint-is-blocking t))))))
+                nil)))))))
 
   (setq this-command 'undo-fu-only-redo))
 
@@ -312,9 +250,6 @@ Optional argument ARG the number of steps to undo."
         (when undo-fu-allow-undo-in-region
           (setq undo-fu--in-region nil))
         (setq undo-fu--respect t)))
-
-    (when (or undo-fu--checkpoint-is-blocking (not was-undo-or-redo))
-      (undo-fu--checkpoint-set))
 
     (when (region-active-p)
       (if undo-fu-allow-undo-in-region
@@ -345,7 +280,7 @@ Optional argument ARG the number of steps to undo."
             (t
               ;; No change.
               last-command)))
-        (success
+        (_success
           (condition-case err
             (progn
               (undo-fu--with-message-suffix
@@ -359,10 +294,7 @@ Optional argument ARG the number of steps to undo."
             (error
               (progn
                 (message "%s" (error-message-string err))
-                nil)))))
-      (when success
-        (when undo-fu--respect
-          (setq undo-fu--checkpoint-is-blocking nil)))))
+                nil)))))))
   (setq this-command 'undo-fu-only-undo))
 
 ;; Evil Mode (setup if in use)
